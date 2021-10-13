@@ -16,6 +16,7 @@ class IdentityLoss(nn.Module):
         self._loss_name = loss_name
 
     def forward(self, x, **kwargs):
+        print('loss weight', self.loss_weight, 'loss', x.cpu().item())
         return x * self.loss_weight
 
     @property

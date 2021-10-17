@@ -3,6 +3,24 @@ import torch.utils.checkpoint as checkpoint
 from ..utils.se_layer import SELayer
 import torch
 from ..builder import BACKBONES
+import torch.nn.functional as F
+
+class SEBlock(nn.Module):
+
+    def __init__(self, input_channels, internal_neurons):
+        super(SEBlock, self).__init__()
+        self.down = nn.Conv2d(in_channels=input_channels, out_channels=internal_neurons, kernel_size=1, stride=1, bias=True)
+        self.up = nn.Conv2d(in_channels=internal_neurons, out_channels=input_channels, kernel_size=1, stride=1, bias=True)
+        self.input_channels = input_channels
+
+    def forward(self, inputs):
+        x = F.avg_pool2d(inputs, kernel_size=inputs.size(3))
+        x = self.down(x)
+        x = F.relu(x)
+        x = self.up(x)
+        x = F.sigmoid(x)
+        x = x.view(-1, self.input_channels, 1, 1)
+        return inputs * x
 
 def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups=1):
     result = nn.Sequential()
@@ -24,7 +42,7 @@ class RepVGGplusBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, groups=1, padding_mode='zeros',
                  deploy=False,
-                 use_post_se=False):
+                 use_post_se=False, use_pre_se=False):
         super(RepVGGplusBlock, self).__init__()
         self.deploy = deploy
         self.groups = groups
@@ -39,6 +57,11 @@ class RepVGGplusBlock(nn.Module):
             self.post_se = SELayer(out_channels, ratio=4)
         else:
             self.post_se = nn.Identity()
+
+        if use_pre_se:
+            self.se = SEBlock(out_channels, internal_neurons=out_channels//16)
+        else:
+            self.se = nn.Identity()
 
         if deploy:
             self.rbr_reparam = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride,
@@ -55,13 +78,13 @@ class RepVGGplusBlock(nn.Module):
 
     def forward(self, x, *args):
         if self.deploy:
-            return self.post_se(self.nonlinearity(self.rbr_reparam(x)))
+            return self.post_se(self.nonlinearity(self.se(self.rbr_reparam(x))))
         if self.rbr_identity is None:
             id_out = 0
         else:
             id_out = self.rbr_identity(x)
         out = self.rbr_dense(x) + self.rbr_1x1(x) + id_out
-        out = self.post_se(self.nonlinearity(out))
+        out = self.post_se(self.nonlinearity(self.se(out)))
 
         if len(args) > 0:      #   Use custom L2. In this case, args[0] should be the accumulated L2
             t3 = (self.rbr_dense.bn.weight / ((self.rbr_dense.bn.running_var + self.rbr_dense.bn.eps).sqrt())).reshape(-1, 1, 1, 1).detach()
@@ -136,7 +159,8 @@ class RepVGGplusBlock(nn.Module):
 
 class RepVGGplusStage(nn.Module):
 
-    def __init__(self, in_planes, planes, num_blocks, stride, with_cp, use_post_se=False, deploy=False, use_custom_L2=False, block_groups=None):
+    def __init__(self, in_planes, planes, num_blocks, stride, with_cp, use_post_se=False, deploy=False, use_custom_L2=False,
+                 block_groups=None, use_pre_se=False):
         super().__init__()
         strides = [stride] + [1] * (num_blocks - 1)
         blocks = []
@@ -147,7 +171,8 @@ class RepVGGplusStage(nn.Module):
             else:
                 cur_groups = block_groups[i]
             blocks.append(RepVGGplusBlock(in_channels=self.in_planes, out_channels=planes, kernel_size=3,
-                                      stride=stride, padding=1, groups=cur_groups, deploy=deploy, use_post_se=use_post_se))
+                                      stride=stride, padding=1, groups=cur_groups, deploy=deploy,
+                                          use_post_se=use_post_se, use_pre_se=use_pre_se))
             self.in_planes = planes
         self.blocks = nn.ModuleList(blocks)
         self.with_cp = with_cp
@@ -190,7 +215,8 @@ class RepVGGplus(nn.Module):
                  use_post_se=False,
                  with_cp=False,
                  use_custom_L2=False,
-                 use_aux_classifiers=False):
+                 use_aux_classifiers=False,
+                 use_pre_se=False):
         super().__init__()
         self.pretrained = pretrained
         self.deploy = deploy
@@ -215,18 +241,18 @@ class RepVGGplus(nn.Module):
 
         self.in_planes = min(64, int(64 * width_multiplier[0]))
         self.stage0 = RepVGGplusBlock(in_channels=3, out_channels=self.in_planes, kernel_size=3, stride=2, padding=1, deploy=self.deploy,
-                                      use_post_se=use_post_se)
+                                      use_post_se=use_post_se, use_pre_se=use_pre_se)
         self.stage1 = RepVGGplusStage(self.in_planes, int(64 * width_multiplier[0]), num_blocks[0], stride=strides[0],
-                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage1_groups)
+                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage1_groups, use_pre_se=use_pre_se)
         self.stage2 = RepVGGplusStage(int(64 * width_multiplier[0]), int(128 * width_multiplier[1]), num_blocks[1], stride=strides[1],
-                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage2_groups)
+                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage2_groups, use_pre_se=use_pre_se)
         #   split stage3 so that we can insert an auxiliary classifier
         self.stage3_first = RepVGGplusStage(int(128 * width_multiplier[1]), int(256 * width_multiplier[2]), num_blocks[2] // 2, stride=strides[2],
-                                            with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage3_first_groups)
+                                            with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage3_first_groups, use_pre_se=use_pre_se)
         self.stage3_second = RepVGGplusStage(int(256 * width_multiplier[2]), int(256 * width_multiplier[2]), num_blocks[2] - num_blocks[2] // 2, stride=strides[3],
-                                             with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage3_second_groups)
+                                             with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage3_second_groups, use_pre_se=use_pre_se)
         self.stage4 = RepVGGplusStage(int(256 * width_multiplier[2]), int(512 * width_multiplier[3]), num_blocks[3], stride=strides[4],
-                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage4_groups)
+                                      with_cp=with_cp, use_post_se=use_post_se, deploy=deploy, use_custom_L2=use_custom_L2, block_groups=stage4_groups, use_pre_se=use_pre_se)
 
 
 

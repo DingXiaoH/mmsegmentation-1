@@ -29,7 +29,9 @@ def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups
     result = nn.Sequential()
     result.add_module('conv', nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                                   kernel_size=kernel_size, stride=stride, padding=padding, groups=groups, bias=False))
-    result.add_module('bn', nn.BatchNorm2d(num_features=out_channels))
+    bn = nn.SyncBatchNorm(out_channels)
+    bn._specify_ddp_gpu_num(1)
+    result.add_module('bn', bn)
     result.add_module('relu', nn.ReLU())
     return result
 
@@ -37,7 +39,9 @@ def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups=1):
     result = nn.Sequential()
     result.add_module('conv', nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                                   kernel_size=kernel_size, stride=stride, padding=padding, groups=groups, bias=False))
-    result.add_module('bn', nn.BatchNorm2d(num_features=out_channels))
+    bn = nn.SyncBatchNorm(out_channels)
+    bn._specify_ddp_gpu_num(1)
+    result.add_module('bn', bn)
     return result
 
 class RepVGGplusBlock(nn.Module):
@@ -71,7 +75,9 @@ class RepVGGplusBlock(nn.Module):
                                       padding=padding, dilation=dilation, groups=groups, bias=True, padding_mode=padding_mode)
         else:
             if out_channels == in_channels and stride == 1:
-                self.rbr_identity = nn.BatchNorm2d(num_features=out_channels)
+                bn = nn.SyncBatchNorm(out_channels)
+                bn._specify_ddp_gpu_num(1)
+                self.rbr_identity = bn
             else:
                 self.rbr_identity = None
             self.rbr_dense = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups)

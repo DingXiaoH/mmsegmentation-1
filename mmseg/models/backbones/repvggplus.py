@@ -273,7 +273,6 @@ class RepVGGplus(nn.Module):
         self.load_state_dict(renamed_weights, strict=True)
 
     def forward(self, x):
-
         if self.deploy or (not self.use_aux_classifiers and not self.use_custom_L2):
             result = []
             out = self.stage0(x)
